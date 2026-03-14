@@ -1,10 +1,12 @@
 /**
  * Base Agent class - the fundamental building block of the mini-agent system.
  * Each agent has a lifecycle: IDLE -> MONITORING -> ENGAGING -> NEGOTIATING -> CLOSING
+ * Integrates with ScoringEngine, RateLimiter, and MessageTemplates for full functionality.
  */
 import { v4 as uuidv4 } from 'uuid';
 import EventEmitter from 'eventemitter3';
 import { logger } from '../utils/logger.js';
+import { MessageTemplates } from './MessageTemplates.js';
 
 export const AgentState = {
   IDLE: 'idle',
@@ -17,7 +19,7 @@ export const AgentState = {
 };
 
 export class Agent extends EventEmitter {
-  constructor({ id, name, platform, config = {}, offerings = [] }) {
+  constructor({ id, name, platform, config = {}, offerings = [], scoringEngine, rateLimiter }) {
     super();
     this.id = id || uuidv4();
     this.name = name || `agent-${this.id.slice(0, 8)}`;
@@ -25,6 +27,9 @@ export class Agent extends EventEmitter {
     this.config = config;
     this.offerings = offerings; // products/services this agent can offer
     this.state = AgentState.IDLE;
+    this.scoringEngine = scoringEngine || null;
+    this.rateLimiter = rateLimiter || null;
+    this.templates = new MessageTemplates();
     this.stats = {
       postsMonitored: 0,
       opportunitiesDetected: 0,
@@ -33,10 +38,12 @@ export class Agent extends EventEmitter {
       dealsClosed: 0,
       revenue: 0,
       messagessSent: 0,
+      messagesBlocked: 0,
       lastActive: null,
     };
     this.activeConversations = new Map();
     this._pollTimer = null;
+    this._followUpCounts = new Map(); // conversationId -> count
   }
 
   /** Start the agent's monitoring loop */
@@ -112,12 +119,43 @@ export class Agent extends EventEmitter {
 
   /** Engage with a detected opportunity */
   async _engageOpportunity(opportunity, post) {
+    // Check rate limits before engaging
+    if (this.rateLimiter) {
+      const check = this.rateLimiter.check(
+        this.platform?.name || 'unknown',
+        post.author || post.userId,
+        post.groupId
+      );
+      if (!check.allowed) {
+        logger.info(`Agent ${this.name} rate limited: ${check.reason}`);
+        this.stats.messagesBlocked++;
+        return;
+      }
+    }
+
+    // Score the opportunity if scoring engine available
+    let score = null;
+    if (this.scoringEngine) {
+      score = this.scoringEngine.scoreOpportunity(opportunity, post);
+      // Skip low-score opportunities
+      if (score.score < (this.config.minOpportunityScore || 20)) {
+        logger.info(`Agent ${this.name} skipping low-score opportunity (${score.score}/100: ${score.grade})`);
+        return;
+      }
+      opportunity.score = score;
+    }
+
     this.state = AgentState.ENGAGING;
     this.emit('stateChange', { agent: this.id, state: this.state });
 
     try {
-      // Craft an initial message based on the opportunity
-      const message = this._craftMessage(opportunity, post);
+      // Use smart templates for message crafting
+      const message = this.templates.initialContact({
+        opportunity,
+        post,
+        platform: this.platform?.name || 'unknown',
+        offering: opportunity.matchedOffering,
+      });
 
       // Send via platform (comment, DM, etc.)
       const result = await this.platform.sendMessage({
@@ -126,6 +164,11 @@ export class Agent extends EventEmitter {
         postId: post.id,
         content: message,
       });
+
+      // Record in rate limiter
+      if (this.rateLimiter) {
+        this.rateLimiter.record(this.platform?.name || 'unknown', post.author || post.userId, post.groupId);
+      }
 
       this.stats.messagessSent++;
       this.stats.dealsInitiated++;
@@ -139,6 +182,8 @@ export class Agent extends EventEmitter {
         targetUser: post.author || post.userId,
         offering: opportunity.matchedOffering,
         stage: 'initial_contact',
+        score: score || null,
+        platform: this.platform?.name,
         messages: [{ role: 'agent', content: message, timestamp: new Date().toISOString() }],
         createdAt: new Date().toISOString(),
       });
@@ -147,6 +192,7 @@ export class Agent extends EventEmitter {
         agent: this.id,
         conversationId,
         opportunity,
+        score,
         result,
       });
     } catch (err) {
@@ -180,26 +226,50 @@ export class Agent extends EventEmitter {
           // Determine next action based on conversation stage
           const action = this._determineAction(conv, reply);
 
+          // Rate limit check before responding
+          if (this.rateLimiter) {
+            const check = this.rateLimiter.check(this.platform?.name || 'unknown', conv.targetUser);
+            if (!check.allowed) {
+              logger.info(`Agent ${this.name} conversation ${convId} rate limited: ${check.reason}`);
+              this.stats.messagesBlocked++;
+              continue;
+            }
+          }
+
           if (action.type === 'negotiate') {
             this.state = AgentState.NEGOTIATING;
             this.stats.dealsNegotiated++;
-            const response = this._craftNegotiationResponse(conv, reply, action);
+            const response = this.templates.negotiate({
+              conversation: conv, reply, offering: conv.offering,
+              platform: this.platform?.name || 'unknown',
+            });
             await this.platform.sendMessage({
               target: conv.targetUser,
               channel: 'dm',
               content: response,
             });
+            if (this.rateLimiter) this.rateLimiter.record(this.platform?.name, conv.targetUser);
             conv.messages.push({ role: 'agent', content: response, timestamp: new Date().toISOString() });
             conv.stage = 'negotiating';
             this.stats.messagessSent++;
+
+            // Score the lead
+            if (this.scoringEngine) {
+              conv.leadScore = this.scoringEngine.scoreLead(conv);
+              this.emit('leadScored', { agent: this.id, conversationId: convId, score: conv.leadScore });
+            }
           } else if (action.type === 'close') {
             this.state = AgentState.CLOSING;
-            const response = this._craftClosingMessage(conv, action);
+            const response = this.templates.close({
+              conversation: conv, offering: conv.offering,
+              platform: this.platform?.name || 'unknown',
+            });
             await this.platform.sendMessage({
               target: conv.targetUser,
               channel: 'dm',
               content: response,
             });
+            if (this.rateLimiter) this.rateLimiter.record(this.platform?.name, conv.targetUser);
             conv.messages.push({ role: 'agent', content: response, timestamp: new Date().toISOString() });
             conv.stage = 'closed';
             this.stats.dealsClosed++;
@@ -211,16 +281,32 @@ export class Agent extends EventEmitter {
               conversationId: convId,
               dealValue: action.dealValue,
               offering: conv.offering,
+              leadScore: conv.leadScore,
             });
 
             this.activeConversations.delete(convId);
           } else if (action.type === 'followup') {
-            const response = this._craftFollowUp(conv, reply);
+            const attempt = (this._followUpCounts.get(convId) || 0) + 1;
+            this._followUpCounts.set(convId, attempt);
+
+            // Max 3 follow-ups
+            if (attempt > 3) {
+              logger.info(`Agent ${this.name} max follow-ups reached for ${convId}, dropping`);
+              this.activeConversations.delete(convId);
+              continue;
+            }
+
+            const response = this.templates.followUp({
+              conversation: conv, offering: conv.offering,
+              platform: this.platform?.name || 'unknown',
+              attempt,
+            });
             await this.platform.sendMessage({
               target: conv.targetUser,
               channel: 'dm',
               content: response,
             });
+            if (this.rateLimiter) this.rateLimiter.record(this.platform?.name, conv.targetUser);
             conv.messages.push({ role: 'agent', content: response, timestamp: new Date().toISOString() });
             this.stats.messagessSent++;
           }

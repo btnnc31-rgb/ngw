@@ -8,7 +8,7 @@ import helmet from 'helmet';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 
-export function createAPIServer({ agentManager, db }) {
+export function createAPIServer({ agentManager, db, adminChat, adminNotifier, scoringEngine, rateLimiter, webhookReceiver }) {
   const app = express();
 
   app.use(cors());
@@ -198,6 +198,90 @@ export function createAPIServer({ agentManager, db }) {
   app.get('/api/platforms', authMiddleware, (req, res) => {
     res.json(agentManager.platformRegistry.list());
   });
+
+  // =========== ADMIN CHAT ===========
+  app.post('/api/admin/chat', authMiddleware, async (req, res) => {
+    try {
+      const { message } = req.body;
+      if (!message) return res.status(400).json({ error: 'Message required' });
+      if (!adminChat) return res.status(503).json({ error: 'Admin chat not configured' });
+      const result = await adminChat.processMessage(message);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/admin/chat/history', authMiddleware, (req, res) => {
+    if (!adminChat) return res.json([]);
+    res.json(adminChat.conversationHistory || []);
+  });
+
+  // =========== REPORTS ===========
+  app.get('/api/admin/report', authMiddleware, (req, res) => {
+    if (!adminNotifier) return res.status(503).json({ error: 'Notifier not configured' });
+    const format = req.query.format || 'json';
+    if (format === 'text') {
+      res.type('text/plain').send(adminNotifier.generateTextReport());
+    } else {
+      res.json(adminNotifier.generateReport());
+    }
+  });
+
+  app.post('/api/admin/notify', authMiddleware, async (req, res) => {
+    try {
+      if (!adminNotifier) return res.status(503).json({ error: 'Notifier not configured' });
+      await adminNotifier.send({
+        type: req.body.type || 'info',
+        title: req.body.title || 'Admin Message',
+        message: req.body.message || '',
+        priority: req.body.priority || 'normal',
+      });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // =========== SCORING ===========
+  app.get('/api/scoring/agents', authMiddleware, (req, res) => {
+    if (!scoringEngine) return res.status(503).json({ error: 'Scoring engine not configured' });
+    const agents = agentManager.getAllStatus();
+    const scored = agents.map(a => ({
+      ...a,
+      scoring: scoringEngine.scoreAgent(a.stats),
+    }));
+    scored.sort((a, b) => b.scoring.score - a.scoring.score);
+    res.json(scored);
+  });
+
+  app.post('/api/scoring/opportunity', authMiddleware, (req, res) => {
+    if (!scoringEngine) return res.status(503).json({ error: 'Scoring engine not configured' });
+    try {
+      const { opportunity, post } = req.body;
+      const score = scoringEngine.scoreOpportunity(opportunity || {}, post || {});
+      res.json(score);
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // =========== RATE LIMITING ===========
+  app.get('/api/ratelimits', authMiddleware, (req, res) => {
+    if (!rateLimiter) return res.json({});
+    res.json(rateLimiter.getStatus());
+  });
+
+  app.post('/api/ratelimits/reset', authMiddleware, (req, res) => {
+    if (!rateLimiter) return res.json({ success: true });
+    rateLimiter.reset();
+    res.json({ success: true });
+  });
+
+  // =========== WEBHOOKS ===========
+  if (webhookReceiver) {
+    webhookReceiver.mount(app);
+  }
 
   // Error handler
   app.use((err, req, res, _next) => {

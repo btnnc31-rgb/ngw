@@ -7,10 +7,12 @@ import { Agent } from './Agent.js';
 import { logger } from '../utils/logger.js';
 
 export class AgentManager extends EventEmitter {
-  constructor({ db, platformRegistry }) {
+  constructor({ db, platformRegistry, scoringEngine, rateLimiter }) {
     super();
     this.db = db;
     this.platformRegistry = platformRegistry;
+    this.scoringEngine = scoringEngine || null;
+    this.rateLimiter = rateLimiter || null;
     this.agents = new Map();
     this._setupEventForwarding();
   }
@@ -22,13 +24,14 @@ export class AgentManager extends EventEmitter {
       throw new Error(`Platform "${platformName}" not registered`);
     }
 
-    const agent = new Agent({ name, platform, config, offerings });
+    const agent = new Agent({ name, platform, config, offerings, scoringEngine: this.scoringEngine, rateLimiter: this.rateLimiter });
     this.agents.set(agent.id, agent);
 
     // Forward agent events
     agent.on('opportunityDetected', (data) => this.emit('opportunityDetected', data));
     agent.on('dealInitiated', (data) => this.emit('dealInitiated', data));
     agent.on('dealClosed', (data) => this._onDealClosed(data));
+    agent.on('leadScored', (data) => this.emit('leadScored', data));
     agent.on('error', (data) => this.emit('agentError', data));
     agent.on('stateChange', (data) => this.emit('agentStateChange', data));
 
@@ -147,6 +150,8 @@ export class AgentManager extends EventEmitter {
           platform,
           config: data.config,
           offerings: data.offerings,
+          scoringEngine: this.scoringEngine,
+          rateLimiter: this.rateLimiter,
         });
         agent.stats = data.stats || agent.stats;
         this.agents.set(agent.id, agent);
@@ -155,6 +160,7 @@ export class AgentManager extends EventEmitter {
         agent.on('opportunityDetected', (d) => this.emit('opportunityDetected', d));
         agent.on('dealInitiated', (d) => this.emit('dealInitiated', d));
         agent.on('dealClosed', (d) => this._onDealClosed(d));
+        agent.on('leadScored', (d) => this.emit('leadScored', d));
         agent.on('error', (d) => this.emit('agentError', d));
         agent.on('stateChange', (d) => this.emit('agentStateChange', d));
       } catch (err) {

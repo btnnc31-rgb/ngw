@@ -366,8 +366,10 @@ export class Agent extends EventEmitter {
 
   /** Craft a closing message */
   _craftClosingMessage(conversation, action) {
-    const offering = conversation.offering;
-    return `Awesome, let's make it happen! Here's how to get started with ${offering.name}: ${offering.signupUrl || offering.actionUrl || '[signup link]'}. Looking forward to working with you!`;
+    const offering = conversation.offering || {};
+    const name = offering.name || 'our service';
+    const link = offering.signupUrl || offering.actionUrl || '[signup link]';
+    return `Awesome, let's make it happen! Here's how to get started with ${name}: ${link}. Looking forward to working with you!`;
   }
 
   /** Craft a follow-up message */
